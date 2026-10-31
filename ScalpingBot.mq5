@@ -1,358 +1,214 @@
 //+------------------------------------------------------------------+
-//|                                              ImprovedScalpingBot.mq5 |
-//|                        Copyright 2024, Your Name                |
-//|                                             https://www.mql5.com |
+//|                                                  ScalpingBot.mq5 |
+//|   v3.0 - regime-aware, score-based scalping EA                   |
+//|   Put ScalpingBot.mq5 and ScalpingBot.mqh in the SAME folder.    |
 //+------------------------------------------------------------------+
-#property copyright "Copyright 2024, Your Name"
-#property link      "https://www.mql5.com"
-#property version   "2.00"
+#property copyright   "ScalpingBot"
+#property version     "3.00"
+#property description "Regime-aware scalping EA: trend/range detection, signal scoring,"
+#property description "ATR-based risk, break-even + trailing, daily loss and streak limits."
 
-#include "ImprovedScalpingBot.mqh"
+#include "ScalpingBot.mqh"
 
-// Input parameters
-input group "=== Trading Parameters ==="
-input double Lots = 0.01;                    // Fixed lot size (0 = auto calculation)
-input double RiskPercent = 1.0;              // Risk per trade (% of account)
-input int StopLoss = 20;                     // Stop loss in points
-input int TakeProfit = 40;                   // Take profit in points
-input double MaxSpreadPoints = 3.0;          // Maximum spread in points
+//--- Position & risk -------------------------------------------------
+input group "=== Position & Risk ==="
+input double InpLots                = 0.0;     // Fixed lot size (0 = size by risk %)
+input double InpRiskPercent         = 1.0;     // Risk per trade, % of balance (used when Lots = 0)
+input bool   InpAllowMinLotOverRisk = false;   // Trade even if the smallest lot risks > 2x the limit
+input int    InpMaxPositions        = 1;       // Max open positions for this EA
+input long   InpMagic               = 20260101;// Magic number (use a different one per chart)
+input int    InpDeviation           = 30;      // Max slippage in points
+input double InpMaxMarginUsePct     = 50.0;    // Skip trade if it needs more than this % of free margin
 
-input group "=== Indicator Settings ==="
-input int RSIPeriod = 14;                    // RSI period
-input int EMAPeriod = 20;                    // EMA period  
-input int BBPeriod = 20;                     // Bollinger Bands period
+//--- Stop loss / take profit -----------------------------------------
+input group "=== Stop Loss / Take Profit ==="
+input bool   InpUseFixedSLTP        = false;   // false = ATR based, true = fixed points
+input double InpSLAtrMult           = 1.5;     // Stop loss = ATR x this
+input double InpTPAtrMult           = 2.5;     // Take profit = ATR x this
+input int    InpFixedSLPoints       = 500;     // Fixed SL in points (only if fixed mode)
+input int    InpFixedTPPoints       = 800;     // Fixed TP in points (only if fixed mode)
 
-input group "=== Risk Management ==="
-input int MaxPositions = 1;                  // Maximum open positions
-input bool UseTrailingStop = true;           // Use trailing stop
-input int TrailingStop = 15;                 // Trailing stop in points
-input int TrailingStep = 5;                  // Trailing step in points
+//--- Indicators -------------------------------------------------------
+input group "=== Indicators ==="
+input ENUM_TIMEFRAMES InpHigherTF   = PERIOD_M15; // Higher timeframe for trend bias
+input int    InpEMAPeriod           = 20;      // EMA period (chart timeframe)
+input int    InpRSIPeriod           = 14;      // RSI period
+input int    InpBBPeriod            = 20;      // Bollinger Bands period
+input double InpBBDeviation         = 2.0;     // Bollinger Bands deviation
+input int    InpATRPeriod           = 14;      // ATR period
+input int    InpADXPeriod           = 14;      // ADX period
+input int    InpHTFEmaPeriod        = 20;      // EMA period on the higher timeframe
 
-input group "=== Advanced Filters ==="
-input bool UseTimeFilter = true;             // Use time filter
-input bool UseATRFilter = true;              // Use ATR volatility filter
-input int ATRPeriod = 14;                    // ATR period
-input double ATRMultiplier = 1.5;            // ATR multiplier for volatility
+//--- Regime -----------------------------------------------------------
+input group "=== Market Regime (ADX) ==="
+input double InpAdxTrend            = 25.0;    // ADX at or above = TREND market
+input double InpAdxRange            = 20.0;    // ADX at or below = RANGE market
 
-// Global variables
-datetime lastBarTime = 0;
-int atrHandle;
+//--- Scoring ----------------------------------------------------------
+input group "=== Signal Scoring ==="
+input int    InpMinScore            = 4;       // Points needed out of 5 (+1 in NEUTRAL regime)
+input double InpRsiOversold         = 35.0;    // Range mode: RSI buy zone
+input double InpRsiOverbought       = 65.0;    // Range mode: RSI sell zone
+input double InpRsiPullback         = 50.0;    // Trend mode: RSI must have dipped to this (sells use 100 - this)
+input bool   InpUseVolume           = true;    // Use tick-volume check (off = counts as passed)
+input int    InpVolLookback         = 10;      // Candles used for average volume
 
-//+------------------------------------------------------------------+
-//| Expert initialization function                                   |
+//--- Filters ----------------------------------------------------------
+input group "=== Filters ==="
+input double InpMaxSpreadAtrFrac    = 0.25;    // Skip if spread > this fraction of ATR (0 = off)
+input int    InpMaxSpreadPoints     = 0;       // Skip if spread > this many points (0 = off)
+input int    InpMinAtrPoints        = 0;       // Skip if ATR < this many points (0 = off)
+input bool   InpUseTimeFilter       = false;   // Only trade inside the hours below
+input int    InpStartHour           = 0;       // Start hour (broker server time)
+input int    InpEndHour             = 24;      // End hour (broker server time)
+
+//--- Safety -----------------------------------------------------------
+input group "=== Safety Limits ==="
+input double InpMaxDailyLossPct     = 3.0;     // Stop for the day after losing this % (0 = off)
+input int    InpMaxConsecLosses     = 3;       // Pause after this many losses in a row (0 = off)
+input int    InpCooldownBars        = 12;      // How many candles to pause
+input int    InpMaxHoldBars         = 24;      // Close a trade older than this many candles (0 = off)
+
+//--- Trade management -------------------------------------------------
+input group "=== Trade Management ==="
+input bool   InpUseBreakEven        = true;    // Move SL to break-even once in profit
+input double InpBETriggerAtr        = 1.0;     // ...when profit reaches ATR x this
+input int    InpBELockPoints        = 5;       // ...and lock this many points of profit
+input bool   InpUseTrail            = true;    // ATR trailing stop after the trigger
+input double InpTrailAtr            = 1.0;     // Trail distance = ATR x this
+
+//--- Display ----------------------------------------------------------
+input group "=== Display ==="
+input bool   InpShowDashboard       = true;    // Show status panel on the chart
+input bool   InpVerbose             = false;   // Print every bar's decision to the Experts log
+
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   Print("Improved ScalpingBot v2.0 initializing...");
-   
-   // Initialize indicators
-   if(!InitializeIndicators(EMAPeriod, RSIPeriod, BBPeriod))
-   {
-      Print("Failed to initialize indicators");
-      return(INIT_FAILED);
-   }
-   
-   // Initialize ATR if using ATR filter
-   if(UseATRFilter)
-   {
-      atrHandle = iATR(_Symbol, PERIOD_M5, ATRPeriod);
-      if(atrHandle == INVALID_HANDLE)
-      {
-         Print("Failed to create ATR handle");
-         return(INIT_FAILED);
-      }
-   }
-   
-   // Set up chart
-   ChartSetInteger(0, CHART_SHOW_GRID, false);
-   ChartSetInteger(0, CHART_SHOW_ASK_LINE, true);
-   
-   Print("ScalpingBot initialized successfully");
-   Print("Symbol: ", _Symbol);
-   Print("Timeframe: M5");
-   Print("Risk per trade: ", RiskPercent, "%");
-   Print("Max positions: ", MaxPositions);
-   
-   return(INIT_SUCCEEDED);
+   cfg.tf                  = _Period;
+   cfg.htf                 = InpHigherTF;
+
+   cfg.lots                = InpLots;
+   cfg.riskPercent         = InpRiskPercent;
+   cfg.allowMinLotOverRisk = InpAllowMinLotOverRisk;
+   cfg.maxPositions        = InpMaxPositions;
+   cfg.magic               = InpMagic;
+   cfg.deviation           = InpDeviation;
+   cfg.maxMarginUsePct     = InpMaxMarginUsePct;
+
+   cfg.useFixedSLTP        = InpUseFixedSLTP;
+   cfg.slAtrMult           = InpSLAtrMult;
+   cfg.tpAtrMult           = InpTPAtrMult;
+   cfg.fixedSLPoints       = InpFixedSLPoints;
+   cfg.fixedTPPoints       = InpFixedTPPoints;
+
+   cfg.emaPeriod           = InpEMAPeriod;
+   cfg.rsiPeriod           = InpRSIPeriod;
+   cfg.bbPeriod            = InpBBPeriod;
+   cfg.bbDev               = InpBBDeviation;
+   cfg.atrPeriod           = InpATRPeriod;
+   cfg.adxPeriod           = InpADXPeriod;
+   cfg.htfEmaPeriod        = InpHTFEmaPeriod;
+
+   cfg.adxTrend            = InpAdxTrend;
+   cfg.adxRange            = InpAdxRange;
+
+   cfg.minScore            = InpMinScore;
+   cfg.rsiOversold         = InpRsiOversold;
+   cfg.rsiOverbought       = InpRsiOverbought;
+   cfg.rsiPullback         = InpRsiPullback;
+   cfg.useVolume           = InpUseVolume;
+   cfg.volLookback         = InpVolLookback;
+
+   cfg.maxSpreadAtrFrac    = InpMaxSpreadAtrFrac;
+   cfg.maxSpreadPoints     = InpMaxSpreadPoints;
+   cfg.minAtrPoints        = InpMinAtrPoints;
+   cfg.useTimeFilter       = InpUseTimeFilter;
+   cfg.startHour           = InpStartHour;
+   cfg.endHour             = InpEndHour;
+
+   cfg.maxDailyLossPct     = InpMaxDailyLossPct;
+   cfg.maxConsecLosses     = InpMaxConsecLosses;
+   cfg.cooldownBars        = InpCooldownBars;
+   cfg.maxHoldBars         = InpMaxHoldBars;
+
+   cfg.useBreakEven        = InpUseBreakEven;
+   cfg.beTriggerAtr        = InpBETriggerAtr;
+   cfg.beLockPoints        = InpBELockPoints;
+   cfg.useTrail            = InpUseTrail;
+   cfg.trailAtr            = InpTrailAtr;
+
+   cfg.showDashboard       = InpShowDashboard;
+   cfg.verbose             = InpVerbose;
+
+   if(!ValidateConfig())
+      return INIT_PARAMETERS_INCORRECT;
+   if(!InitBot())
+      return INIT_FAILED;
+
+   if(cfg.tf != PERIOD_M5)
+      Print("ScalpingBot: designed for M5 - you are on ", EnumToString(cfg.tf), ". Defaults may need retuning.");
+
+   Print("ScalpingBot v", BOT_VERSION, " started on ", _Symbol, " ", EnumToString(cfg.tf),
+         " | higher TF ", EnumToString(cfg.htf), " | magic ", cfg.magic);
+   return INIT_SUCCEEDED;
 }
 
-//+------------------------------------------------------------------+
-//| Expert deinitialization function                                 |
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-   CleanupIndicators();
-   
-   if(UseATRFilter && atrHandle != INVALID_HANDLE)
-      IndicatorRelease(atrHandle);
-      
-   Print("ScalpingBot deinitialized. Reason: ", reason);
+   ReleaseBot();
+   Comment("");
+   Print("ScalpingBot stopped. Reason code: ", reason);
 }
 
-//+------------------------------------------------------------------+
-//| Check if new bar formed                                         |
-//+------------------------------------------------------------------+
-bool IsNewBar()
-{
-   datetime currentBarTime = iTime(_Symbol, PERIOD_M5, 0);
-   if(currentBarTime != lastBarTime)
-   {
-      lastBarTime = currentBarTime;
-      return true;
-   }
-   return false;
-}
-
-//+------------------------------------------------------------------+
-//| Get ATR value                                                   |
-//+------------------------------------------------------------------+
-double GetATR(int shift = 0)
-{
-   if(!UseATRFilter) return 0.0;
-   
-   double buffer[1];
-   if(CopyBuffer(atrHandle, 0, shift, 1, buffer) <= 0)
-   {
-      Print("Failed to copy ATR buffer");
-      return 0.0;
-   }
-   return buffer[0];
-}
-
-//+------------------------------------------------------------------+
-//| Check volatility using ATR                                     |
-//+------------------------------------------------------------------+
-bool IsVolatilityAcceptable()
-{
-   if(!UseATRFilter) return true;
-   
-   double atr = GetATR();
-   if(atr <= 0) return false;
-   
-   double currentSpread = symbolInfo.Spread() * symbolInfo.Point();
-   double minVolatility = currentSpread * ATRMultiplier;
-   
-   return atr >= minVolatility;
-}
-
-//+------------------------------------------------------------------+
-//| Manage trailing stop                                           |
-//+------------------------------------------------------------------+
-void ManageTrailingStop()
-{
-   if(!UseTrailingStop) return;
-   
-   double point = symbolInfo.Point();
-   double trailStop = TrailingStop * point;
-   double trailStep = TrailingStep * point;
-   
-   // Adjust for 5-digit brokers
-   if(symbolInfo.Digits() == 5 || symbolInfo.Digits() == 3)
-   {
-      trailStop *= 10;
-      trailStep *= 10;
-   }
-   
-   for(int i = 0; i < PositionsTotal(); i++)
-   {
-      if(!positionInfo.SelectByIndex(i)) continue;
-      if(positionInfo.Symbol() != _Symbol || positionInfo.Magic() != MAGIC_NUMBER) continue;
-      
-      double currentPrice = (positionInfo.PositionType() == POSITION_TYPE_BUY) ? 
-                           symbolInfo.Bid() : symbolInfo.Ask();
-      double currentSL = positionInfo.StopLoss();
-      double openPrice = positionInfo.PriceOpen();
-      
-      if(positionInfo.PositionType() == POSITION_TYPE_BUY)
-      {
-         double newSL = NormalizeDouble(currentPrice - trailStop, symbolInfo.Digits());
-         
-         if(newSL > currentSL + trailStep || currentSL == 0)
-         {
-            if(newSL > openPrice) // Only move SL to profit
-            {
-               trade.PositionModify(positionInfo.Ticket(), newSL, positionInfo.TakeProfit());
-               Print("Trailing stop updated for BUY position. New SL: ", newSL);
-            }
-         }
-      }
-      else if(positionInfo.PositionType() == POSITION_TYPE_SELL)
-      {
-         double newSL = NormalizeDouble(currentPrice + trailStop, symbolInfo.Digits());
-         
-         if(newSL < currentSL - trailStep || currentSL == 0)
-         {
-            if(newSL < openPrice) // Only move SL to profit
-            {
-               trade.PositionModify(positionInfo.Ticket(), newSL, positionInfo.TakeProfit());
-               Print("Trailing stop updated for SELL position. New SL: ", newSL);
-            }
-         }
-      }
-   }
-}
-
-//+------------------------------------------------------------------+
-//| Enhanced signal validation                                      |
-//+------------------------------------------------------------------+
-bool ValidateBuySignal(double price, double ema, double rsi, double bbUpper, double bbLower)
-{
-   // Basic conditions
-   if(!(price > ema && rsi < 35 && price <= bbLower + (bbUpper - bbLower) * 0.2))
-      return false;
-   
-   // Check if bullish engulfing pattern exists
-   if(!IsBullishEngulfing())
-      return false;
-   
-   // Additional confirmation: Price should be in lower 30% of BB range
-   double bbRange = bbUpper - bbLower;
-   double pricePosition = (price - bbLower) / bbRange;
-   if(pricePosition > 0.3)
-      return false;
-   
-   // RSI should be recovering from oversold
-   double rsiPrev = GetRSI(1);
-   if(rsiPrev == EMPTY_VALUE || rsi <= rsiPrev)
-      return false;
-   
-   return true;
-}
-
-//+------------------------------------------------------------------+
-//| Enhanced signal validation for sell                            |
-//+------------------------------------------------------------------+
-bool ValidateSellSignal(double price, double ema, double rsi, double bbUpper, double bbLower)
-{
-   // Basic conditions  
-   if(!(price < ema && rsi > 65 && price >= bbUpper - (bbUpper - bbLower) * 0.2))
-      return false;
-   
-   // Check if bearish engulfing pattern exists
-   if(!IsBearishEngulfing())
-      return false;
-   
-   // Additional confirmation: Price should be in upper 30% of BB range
-   double bbRange = bbUpper - bbLower;
-   double pricePosition = (price - bbLower) / bbRange;
-   if(pricePosition < 0.7)
-      return false;
-   
-   // RSI should be falling from overbought
-   double rsiPrev = GetRSI(1);
-   if(rsiPrev == EMPTY_VALUE || rsi >= rsiPrev)
-      return false;
-   
-   return true;
-}
-
-//+------------------------------------------------------------------+
-//| Expert tick function                                             |
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   // Only trade on new bar formation
+   // Between candles we only look after the trade that is already open.
    if(!IsNewBar())
    {
-      ManageTrailingStop(); // Still manage trailing stops on every tick
+      if(g_atr > 0.0)
+         ManagePositions(g_atr);
       return;
    }
-   
-   // Check if we have reached maximum positions
-   if(CountPositions() >= MaxPositions)
-      return;
-   
-   // Check time filter
-   if(UseTimeFilter && !IsTradingTimeAllowed())
-      return;
-   
-   // Check volatility filter
-   if(!IsVolatilityAcceptable())
-   {
-      Print("Volatility too low for trading");
-      return;
-   }
-   
-   // Check spread
-   if(!IsSpreadAcceptable(MaxSpreadPoints))
-   {
-      Print("Spread too wide: ", symbolInfo.Spread() * symbolInfo.Point());
-      return;
-   }
-   
-   // Get current price
-   double price = symbolInfo.Bid();
-   
-   // Calculate indicators
-   double ema = GetEMA();
-   double rsi = GetRSI();
-   double bbUpper, bbMiddle, bbLower;
-   
-   if(ema == EMPTY_VALUE || rsi == EMPTY_VALUE || !GetBollingerBands(bbUpper, bbMiddle, bbLower))
-   {
-      Print("Failed to get indicator values");
-      return;
-   }
-   
-   // Check MTF trend confirmation
-   bool uptrendMTF = IsUptrendMTF();
-   
-   // Calculate lot size
-   double lotSize = Lots;
-   if(Lots <= 0)
-   {
-      lotSize = CalculateLotSize(RiskPercent, StopLoss);
-      Print("Calculated lot size: ", lotSize);
-   }
-   
-   // Look for buy signal
-   if(uptrendMTF && ValidateBuySignal(price, ema, rsi, bbUpper, bbLower))
-   {
-      if(OpenBuyOrder(lotSize, StopLoss, TakeProfit))
-      {
-         Print("BUY signal executed:");
-         Print("Price: ", price, " EMA: ", ema, " RSI: ", rsi);
-         Print("BB Upper: ", bbUpper, " BB Lower: ", bbLower);
-      }
-   }
-   // Look for sell signal  
-   else if(!uptrendMTF && ValidateSellSignal(price, ema, rsi, bbUpper, bbLower))
-   {
-      if(OpenSellOrder(lotSize, StopLoss, TakeProfit))
-      {
-         Print("SELL signal executed:");
-         Print("Price: ", price, " EMA: ", ema, " RSI: ", rsi);
-         Print("BB Upper: ", bbUpper, " BB Lower: ", bbLower);
-      }
-   }
-}
 
-//+------------------------------------------------------------------+
-//| Timer function for additional management                        |
-//+------------------------------------------------------------------+
-void OnTimer()
-{
-   // This can be used for additional periodic checks
-   // Set timer in OnInit() if needed: EventSetTimer(60); // 60 seconds
-}
-
-//+------------------------------------------------------------------+
-//| Handle trade events                                             |
-//+------------------------------------------------------------------+
-void OnTrade()
-{
-   // Log trade results for analysis
-   static datetime lastTradeTime = 0;
-   datetime currentTime = TimeCurrent();
-   
-   if(currentTime != lastTradeTime)
+   // A new candle just opened: decide using the candles that are now CLOSED.
+   SMarket m;
+   if(!ReadMarket(m))
    {
-      lastTradeTime = currentTime;
-      
-      // You can add trade logging or notification logic here
-      double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-      double balance = AccountInfoDouble(ACCOUNT_BALANCE);
-      
-      Print("Trade event - Equity: ", equity, " Balance: ", balance);
+      g_lastBar = 0;   // indicators not ready yet - try again on the next tick
+      return;
    }
+
+   g_atr = m.atr1;
+   ManagePositions(g_atr);
+
+   ENUM_REGIME regime = GetRegime(m);
+   SScore s;
+   ScoreSignals(m, regime, s);
+
+   string blocked = CheckGates(m);
+   int signal = (blocked == "") ? Decide(s) : 0;
+
+   if(signal == 1)
+   {
+      string note = "regime " + RegimeName(regime) + " | score " + IntegerToString(s.buy) + "/5 | " + s.buyWhy;
+      g_status = OpenTrade(true, m.atr1, note) ? "BUY opened" : "BUY signal, order not placed";
+   }
+   else if(signal == -1)
+   {
+      string note = "regime " + RegimeName(regime) + " | score " + IntegerToString(s.sell) + "/5 | " + s.sellWhy;
+      g_status = OpenTrade(false, m.atr1, note) ? "SELL opened" : "SELL signal, order not placed";
+   }
+   else
+      g_status = (blocked != "") ? blocked : "Waiting for a setup";
+
+   if(cfg.verbose)
+      Print("Bar | ", RegimeName(regime), " | BUY ", s.buy, " (", s.buyWhy, ") | SELL ", s.sell,
+            " (", s.sellWhy, ") | need ", s.needed, " | ", g_status);
+
+   if(cfg.showDashboard)
+      ShowDashboard(m, regime, s);
 }
+//+------------------------------------------------------------------+
